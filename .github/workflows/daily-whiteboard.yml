@@ -1,0 +1,60 @@
+name: Daily Whiteboard Reels
+on:
+  workflow_dispatch:
+    inputs:
+      slot: {description: "Content slot 1, 2, or 3", required: true, default: "1"}
+      publish: {description: "Publish to Facebook after QA", required: true, type: boolean, default: false}
+  schedule:
+    - cron: "15 1 * * *"   # 08:15 Vietnam
+    - cron: "15 6 * * *"   # 13:15 Vietnam
+    - cron: "15 12 * * *"  # 19:15 Vietnam
+permissions: {contents: write}
+concurrency: {group: whiteboard-reels-autopilot, cancel-in-progress: false}
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_TEXT_MODEL: ${{ vars.OPENAI_TEXT_MODEL || 'gpt-5.6-luna' }}
+      OPENAI_IMAGE_MODEL: ${{ vars.OPENAI_IMAGE_MODEL || 'gpt-image-2' }}
+      OPENAI_IMAGE_QUALITY: ${{ vars.OPENAI_IMAGE_QUALITY || 'medium' }}
+      LUCYLAB_API_KEY: ${{ secrets.LUCYLAB_API_KEY }}
+      LUCYLAB_SPEED: ${{ vars.LUCYLAB_SPEED || '1.0' }}
+      TARGET_VOICE_SEC: ${{ vars.TARGET_VOICE_SEC || '46.0' }}
+      META_PAGE_ID: ${{ secrets.META_PAGE_ID }}
+      META_PAGE_ACCESS_TOKEN: ${{ secrets.META_PAGE_ACCESS_TOKEN }}
+      META_GRAPH_VERSION: ${{ vars.META_GRAPH_VERSION || 'v26.0' }}
+      AUTO_PUBLISH_ENABLED: ${{ vars.AUTO_PUBLISH_ENABLED || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip, cache-dependency-path: requirements-autopilot.txt}
+      - run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+      - run: pip install -r requirements-autopilot.txt
+      - run: python automation/autopilot.py --self-test
+      - name: Refuse paid-TTS reruns
+        run: test "$GITHUB_RUN_ATTEMPT" = "1" || { echo "Do not rerun paid TTS jobs; inspect the prior artifact/checkpoint." >&2; exit 1; }
+      - name: Resolve mode
+        id: mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            SLOT="${{ github.event.inputs.slot }}"; [ "${{ github.event.inputs.publish }}" = true ] && PUB=--publish || PUB=""
+          else
+            case "${{ github.event.schedule }}" in "15 1 * * *") SLOT=1;; "15 6 * * *") SLOT=2;; *) SLOT=3;; esac
+            [ "$AUTO_PUBLISH_ENABLED" = true ] && PUB=--publish || PUB=""
+          fi
+          echo "slot=$SLOT" >> "$GITHUB_OUTPUT"; echo "publish=$PUB" >> "$GITHUB_OUTPUT"
+      - run: python automation/autopilot.py --slot "${{ steps.mode.outputs.slot }}" ${{ steps.mode.outputs.publish }}
+      - name: Save subject history
+        if: success()
+        run: |
+          git config user.name whiteboard-reels-bot
+          git config user.email whiteboard-reels-bot@users.noreply.github.com
+          git add state/history.json
+          if ! git diff --cached --quiet; then git commit -m "bot: record whiteboard reel" && git push; fi
+      - name: Upload evidence and LucyLab checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: {name: "whiteboard-reel-${{ github.run_id }}", path: output/, if-no-files-found: ignore, retention-days: 30}
